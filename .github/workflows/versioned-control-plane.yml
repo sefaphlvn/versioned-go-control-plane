@@ -1,0 +1,349 @@
+name: Update Go Control Plane with Custom Envoy Protos
+
+on:
+  workflow_dispatch:
+    inputs:
+      control_plane_version:
+        description: "Go Control Plane version to fork (e.g., v0.13.2)"
+        required: true
+        type: string
+      envoy_version:
+        description: "Envoy version to use for protos (e.g., v1.32.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-22.04
+    steps:
+      # --------------------------------------------------
+      # 1) Configure Git identity (global settings)
+      # --------------------------------------------------
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Action"
+          git config --global user.email "action@github.com"
+          git config --global init.defaultBranch main
+
+      # --------------------------------------------------
+      # 2) Checkout current repository (main branch)
+      # --------------------------------------------------
+      - name: Checkout Current Repository
+        uses: actions/checkout@v4
+        with:
+          path: current-repo
+          fetch-depth: 1
+          ref: main
+
+      # --------------------------------------------------
+      # 3) Checkout the official Go Control Plane repo
+      # --------------------------------------------------
+      - name: Checkout Go Control Plane
+        uses: actions/checkout@v4
+        with:
+          repository: envoyproxy/go-control-plane
+          ref: ${{ github.event.inputs.control_plane_version }}
+          path: go-control-plane
+          fetch-depth: 0
+
+      # --------------------------------------------------
+      # 4) Enable Git LFS for large file storage
+      # --------------------------------------------------
+      - name: Setup Git LFS
+        run: |
+          git lfs install
+          cd go-control-plane
+          git lfs install
+
+      # --------------------------------------------------
+      # 5) Update module name and import paths
+      # --------------------------------------------------
+      - name: Update Module Name
+        run: |
+          cd go-control-plane
+          # Replace the module name in go.mod
+          sed -i 's|module github.com/envoyproxy/go-control-plane|module github.com/sefaphlvn/versioned-go-control-plane|g' go.mod
+          # Replace all import paths in .go files
+          find . -type f -name "*.go" -exec sed -i 's|github.com/envoyproxy/go-control-plane|github.com/sefaphlvn/versioned-go-control-plane|g' {} \;
+
+      # --------------------------------------------------
+      # 6) Checkout Envoy repository (for proto sources)
+      # --------------------------------------------------
+      - name: Checkout Envoy Repository
+        uses: actions/checkout@v4
+        with:
+          repository: envoyproxy/envoy
+          ref: ${{ github.event.inputs.envoy_version }}
+          path: envoy-src
+
+      # --------------------------------------------------
+      # 7) Check existing releases in the forked repo
+      #    and download them if present
+      # --------------------------------------------------
+      - name: Check and Download Existing Releases
+        id: check_releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ENVOY_VERSION=$(echo ${{ github.event.inputs.envoy_version }} | sed 's/^v//')
+          CONTROL_PLANE_VERSION=$(echo ${{ github.event.inputs.control_plane_version }} | sed 's/^v//')
+          TAG_VERSION="${CONTROL_PLANE_VERSION}-envoy${ENVOY_VERSION}"
+          
+          # Check if the main release (v{TAG_VERSION}) already exists
+          if gh release view "v${TAG_VERSION}" --repo sefaphlvn/versioned-go-control-plane &>/dev/null; then
+            echo "Release v${TAG_VERSION} already exists. Skipping pipeline..."
+            echo "main_release_exists=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "main_release_exists=false" >> $GITHUB_OUTPUT
+          
+          # Extract ratelimit version from original go-control-plane's go.mod
+          RATELIMIT_VERSION=$(grep "github.com/envoyproxy/go-control-plane/ratelimit" go-control-plane/go.mod | awk '{print $2}' | tr -d '"' | tr -d '\n' | sed 's/=>//')
+          if [ -z "$RATELIMIT_VERSION" ]; then
+            RATELIMIT_VERSION="v0.1.0"
+          fi
+          echo "RATELIMIT_VERSION=${RATELIMIT_VERSION}" >> $GITHUB_ENV
+          
+          # Prepare temporary directories
+          mkdir -p temp/{envoy,ratelimit,contrib}
+          
+          # Check and download Envoy release
+          if gh release view "envoy/v${ENVOY_VERSION}" --repo sefaphlvn/versioned-go-control-plane &>/dev/null; then
+            echo "Found existing Envoy release, downloading..."
+            gh release download "envoy/v${ENVOY_VERSION}" --repo sefaphlvn/versioned-go-control-plane --dir temp/envoy
+            cd temp/envoy
+            tar xzf *.tar.gz
+            if [ -d "envoy" ]; then
+              cd ../..
+              cp -r temp/envoy/envoy/* go-control-plane/envoy/
+            else
+              cd ../..
+              echo "Error: No envoy directory found in the release tarball"
+              exit 1
+            fi
+            echo "envoy_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "envoy_exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check and download Ratelimit release
+          if gh release view "ratelimit/${RATELIMIT_VERSION}" --repo sefaphlvn/versioned-go-control-plane &>/dev/null; then
+            echo "Found existing Ratelimit release, downloading..."
+            gh release download "ratelimit/${RATELIMIT_VERSION}" --repo sefaphlvn/versioned-go-control-plane --dir temp/ratelimit
+            cd temp/ratelimit
+            tar xzf *.tar.gz
+            if [ -d "ratelimit" ]; then
+              cd ../..
+              cp -r temp/ratelimit/ratelimit/* go-control-plane/ratelimit/
+            else
+              cd ../..
+              echo "Error: No ratelimit directory found in the release tarball"
+              exit 1
+            fi
+            echo "ratelimit_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "ratelimit_exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Check and download Contrib release
+          if gh release view "contrib/v${ENVOY_VERSION}" --repo sefaphlvn/versioned-go-control-plane &>/dev/null; then
+            echo "Found existing Contrib release, downloading..."
+            gh release download "contrib/v${ENVOY_VERSION}" --repo sefaphlvn/versioned-go-control-plane --dir temp/contrib
+            cd temp/contrib
+            tar xzf *.tar.gz
+            if [ -d "contrib" ]; then
+              cd ../..
+              cp -r temp/contrib/contrib/* go-control-plane/contrib/
+            else
+              cd ../..
+              echo "Error: No contrib directory found in the release tarball"
+              exit 1
+            fi
+            echo "contrib_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "contrib_exists=false" >> $GITHUB_OUTPUT
+          fi
+          
+          # Clean up temporary folder
+          rm -rf temp
+
+      # --------------------------------------------------
+      # 8) Generate Envoy protos if the Envoy release
+      #    does not exist in the fork
+      # --------------------------------------------------
+      - name: Generate Envoy Protos
+        if: steps.check_releases.outputs.envoy_exists == 'false'
+        run: |
+          cd go-control-plane
+          
+          # Re-check Ratelimit version
+          RATELIMIT_VERSION=$(grep "github.com/envoyproxy/go-control-plane/ratelimit" go.mod | awk '{print $2}' | tr -d '"' | tr -d '\n' | sed 's/=>//')
+          if [ -z "$RATELIMIT_VERSION" ]; then
+            RATELIMIT_VERSION="v0.1.0"
+          fi
+          
+          # Remove any existing envoy/contrib directories before generation
+          rm -rf envoy contrib
+          
+          # Copy the sync_protos.sh script from the current repo
+          cp ../current-repo/sync_protos.sh .
+          chmod +x sync_protos.sh
+          
+          # Run protos generation
+          ENVOY_SRC_DIR="../envoy-src" \
+          ENVOY_VERSION="${{ github.event.inputs.envoy_version }}" \
+          RATELIMIT_VERSION="${{ env.RATELIMIT_VERSION }}" \
+          ./sync_protos.sh
+          
+          # Strip the 'v' prefix from versions
+          CONTROL_PLANE_VERSION=$(echo ${{ github.event.inputs.control_plane_version }} | sed 's/^v//')
+          ENVOY_VERSION=$(echo ${{ github.event.inputs.envoy_version }} | sed 's/^v//')
+          TAG_VERSION="${CONTROL_PLANE_VERSION}-envoy${ENVOY_VERSION}"
+          
+          # Update the main go.mod with module replacements
+          printf "module github.com/sefaphlvn/versioned-go-control-plane\n\ngo 1.22\n\nreplace (\n  github.com/sefaphlvn/versioned-go-control-plane/envoy => ./envoy\n  github.com/sefaphlvn/versioned-go-control-plane/ratelimit => ./ratelimit\n)\n\nrequire (\n  github.com/sefaphlvn/versioned-go-control-plane/envoy v%s\n  github.com/sefaphlvn/versioned-go-control-plane/ratelimit %s\n  github.com/google/go-cmp v0.6.0\n  github.com/stretchr/testify v1.10.0\n  go.uber.org/goleak v1.3.0\n  google.golang.org/genproto/googleapis/rpc v0.0.0-20241015192408-796eee8c2d53\n  google.golang.org/grpc v1.69.4\n  google.golang.org/protobuf v1.36.3\n)\n" "${ENVOY_VERSION}" "${RATELIMIT_VERSION}" > go.mod
+          
+          echo "Debug: Generated go.mod content:"
+          cat go.mod
+          echo "Debug: ENVOY_VERSION=${ENVOY_VERSION}"
+          echo "Debug: RATELIMIT_VERSION=${RATELIMIT_VERSION}"
+          
+          # envoy/go.mod
+          printf "module github.com/sefaphlvn/versioned-go-control-plane/envoy\n\ngo 1.22\n\nrequire (\n  google.golang.org/genproto/googleapis/rpc v0.0.0-20241015192408-796eee8c2d53\n  google.golang.org/protobuf v1.36.3\n)\n" > envoy/go.mod
+          
+          # ratelimit/go.mod
+          printf "module github.com/sefaphlvn/versioned-go-control-plane/ratelimit\n\ngo 1.22\n\nrequire (\n  github.com/sefaphlvn/versioned-go-control-plane/envoy v%s\n  google.golang.org/protobuf v1.36.3\n)\n\nreplace github.com/sefaphlvn/versioned-go-control-plane/envoy => ../envoy\n" "${ENVOY_VERSION}" > ratelimit/go.mod
+          
+          # contrib/go.mod (only if contrib directory exists)
+          if [ -d "contrib" ]; then
+            printf "module github.com/sefaphlvn/versioned-go-control-plane/contrib\n\ngo 1.22\n\nrequire (\n  github.com/sefaphlvn/versioned-go-control-plane/envoy v%s\n  google.golang.org/protobuf v1.36.3\n)\n\nreplace github.com/sefaphlvn/versioned-go-control-plane/envoy => ../envoy\n" "${ENVOY_VERSION}" > contrib/go.mod
+          fi
+          
+          # Tidy up each module's dependencies
+          go mod tidy
+          cd envoy && go mod tidy && cd ..
+          if [ -d "contrib" ]; then
+            cd contrib && go mod tidy && cd ..
+          fi
+
+      # --------------------------------------------------
+      # 9) Push changes and create tags if the main
+      #    release does not exist
+      # --------------------------------------------------
+      - name: Push Changes and Create Tags
+        if: steps.check_releases.outputs.main_release_exists == 'false'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd go-control-plane
+          
+          # Remove existing .git to start fresh
+          rm -rf .git
+          
+          # Strip the 'v' prefix from input versions
+          CONTROL_PLANE_VERSION=$(echo ${{ github.event.inputs.control_plane_version }} | sed 's/^v//')
+          ENVOY_VERSION=$(echo ${{ github.event.inputs.envoy_version }} | sed 's/^v//')
+          RATELIMIT_VERSION="${{ env.RATELIMIT_VERSION }}"
+          
+          TAG_VERSION="${CONTROL_PLANE_VERSION}-envoy${ENVOY_VERSION}"
+          BRANCH_NAME="release/${CONTROL_PLANE_VERSION}-envoy${ENVOY_VERSION}"
+          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/sefaphlvn/versioned-go-control-plane.git"
+          
+          # Initialize a new git repo and configure identity
+          git init
+          git config user.name "GitHub Action"
+          git config user.email "action@github.com"
+          
+          # Remove any workflow/CI files from the fork
+          rm -rf .github/workflows/
+          find . -name "ci.yaml" -type f -delete
+          find . -name "ci.yml" -type f -delete
+          
+          git add .
+          git commit -m "Generated protos from envoy ${{ github.event.inputs.envoy_version }}"
+          
+          # Prepare remote and branch
+          git remote add origin "${REPO_URL}"
+          git checkout -b "${BRANCH_NAME}"
+          
+          # Create tags for each module
+          git tag "v${TAG_VERSION}"                 # main module
+          git tag "envoy/v${ENVOY_VERSION}"         # envoy module
+          git tag "ratelimit/${RATELIMIT_VERSION}"  # ratelimit module
+          if [ -d "contrib" ]; then
+            git tag "contrib/v${ENVOY_VERSION}"     # contrib module
+          fi
+          
+          # Push the new branch and all tags
+          git push -u origin "${BRANCH_NAME}" --force
+          git push origin "v${TAG_VERSION}" --force
+          git push origin "envoy/v${ENVOY_VERSION}" --force
+          git push origin "ratelimit/${RATELIMIT_VERSION}" --force
+          if [ -d "contrib" ]; then
+            git push origin "contrib/v${ENVOY_VERSION}" --force
+          fi
+
+      # --------------------------------------------------
+      # 10) Create GitHub releases for each module
+      #     if the main release doesn't exist
+      # --------------------------------------------------
+      - name: Create Releases
+        if: steps.check_releases.outputs.main_release_exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd go-control-plane
+          
+          CONTROL_PLANE_VERSION=$(echo ${{ github.event.inputs.control_plane_version }} | sed 's/^v//')
+          ENVOY_VERSION=$(echo ${{ github.event.inputs.envoy_version }} | sed 's/^v//')
+          RATELIMIT_VERSION="${{ env.RATELIMIT_VERSION }}"
+          TAG_VERSION="${CONTROL_PLANE_VERSION}-envoy${ENVOY_VERSION}"
+          
+          # Envoy release (if missing)
+          if [ "${{ steps.check_releases.outputs.envoy_exists }}" != "true" ]; then
+            tar -czf envoy.tar.gz envoy/
+            gh release create \
+              "envoy/v${ENVOY_VERSION}" \
+              envoy.tar.gz \
+              --title "Envoy Module ${ENVOY_VERSION}" \
+              --notes "Envoy protos generated from envoy ${{ github.event.inputs.envoy_version }}" \
+              --repo sefaphlvn/versioned-go-control-plane
+            rm envoy.tar.gz
+          fi
+          
+          # Ratelimit release (if missing)
+          if ! gh release view "ratelimit/${RATELIMIT_VERSION}" --repo sefaphlvn/versioned-go-control-plane &>/dev/null; then
+            tar -czf ratelimit.tar.gz ratelimit/
+            gh release create \
+              "ratelimit/${RATELIMIT_VERSION}" \
+              ratelimit.tar.gz \
+              --title "Ratelimit Module ${RATELIMIT_VERSION}" \
+              --notes "Ratelimit module for versioned-go-control-plane" \
+              --repo sefaphlvn/versioned-go-control-plane
+            rm ratelimit.tar.gz
+          fi
+          
+          # Contrib release (if missing)
+          if [ -d "contrib" ] && [ "${{ steps.check_releases.outputs.contrib_exists }}" != "true" ]; then
+            tar -czf contrib.tar.gz contrib/
+            gh release create \
+              "contrib/v${ENVOY_VERSION}" \
+              contrib.tar.gz \
+              --title "Contrib Module ${ENVOY_VERSION}" \
+              --notes "Contrib module for versioned-go-control-plane" \
+              --repo sefaphlvn/versioned-go-control-plane
+            rm contrib.tar.gz
+          fi
+          
+          # Main release
+          tar -czf versioned-go-control-plane.tar.gz *
+          gh release create \
+            "v${TAG_VERSION}" \
+            versioned-go-control-plane.tar.gz \
+            --title "Go Control Plane ${CONTROL_PLANE_VERSION} with Envoy Protos ${ENVOY_VERSION}" \
+            --notes "Fork of go-control-plane ${{ github.event.inputs.control_plane_version }} using generated protos from envoy ${{ github.event.inputs.envoy_version }}" \
+            --repo sefaphlvn/versioned-go-control-plane
+          rm versioned-go-control-plane.tar.gz
