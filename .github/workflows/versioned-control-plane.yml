@@ -1,4 +1,4 @@
-name: Update Go Control Plane with Custom Envoy Protos
+name: Generate Versioned Go Control Plane
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  update:
+  build_release:
     runs-on: ubuntu-22.04
     steps:
       # --------------------------------------------------
